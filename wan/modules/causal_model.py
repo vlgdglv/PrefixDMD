@@ -96,7 +96,8 @@ class CausalWanSelfAttention(nn.Module):
         block_mask,
         kv_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        update_kv_cache=True,
     ):
         r"""
         Args:
@@ -202,6 +203,39 @@ class CausalWanSelfAttention(nn.Module):
             roped_key = causal_rope_apply(
                 k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 
+            if not update_kv_cache:
+                # ------------------------------------------------------
+                # Read-only prefix cache.
+                # Context KV is fixed; current chunk KV only participates
+                # in this attention call and is NOT written into the cache.
+                # ------------------------------------------------------
+                # print("KV Cache NOT update.")
+                local_end = kv_cache["local_end_index"].item()
+                num_new_tokens = roped_key.shape[1]
+                if self.local_attn_size == -1:
+                    cached_k = kv_cache["k"][:, :local_end]
+                    cached_v = kv_cache["v"][:, :local_end]
+                else:
+                    # Match the normal inference behavior:
+                    # total context + current should stay inside max_attention_size.
+                    num_ctx_keep = max(self.max_attention_size - num_new_tokens,0,)
+                    ctx_start = max(local_end - num_ctx_keep, 0,)
+                    cached_k = kv_cache["k"][:, ctx_start:local_end]
+                    cached_v = kv_cache["v"][:, ctx_start:local_end]
+
+                attn_k = torch.cat([cached_k.detach(), roped_key], dim=1,)
+                attn_v = torch.cat([cached_v.detach(), v], dim=1,)
+
+                x = attention(
+                    roped_query,
+                    attn_k,
+                    attn_v,
+                )
+
+                x = x.flatten(2)
+                x = self.o(x)
+                return x
+
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
@@ -298,7 +332,8 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        update_kv_cache=True,
     ):
         r"""
         Args:
@@ -318,7 +353,7 @@ class CausalWanAttentionBlock(nn.Module):
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start)
+            freqs, block_mask, kv_cache, current_start, cache_start, update_kv_cache)
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -725,7 +760,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        update_kv_cache: bool = True,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -820,7 +856,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     {
                         "kv_cache": kv_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "update_kv_cache": update_kv_cache,
                     }
                 )
                 x = torch.utils.checkpoint.checkpoint(
@@ -834,7 +871,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "kv_cache": kv_cache[block_index],
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "update_kv_cache": update_kv_cache,
                     }
                 )
                 x = block(x, **kwargs)
@@ -855,6 +893,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        update_kv_cache=True,
     ):
         r"""
         Forward pass through the diffusion model
@@ -977,7 +1016,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask)
+            block_mask=self.block_mask,
+            update_kv_cache=update_kv_cache
+        )
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):

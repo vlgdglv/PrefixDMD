@@ -69,7 +69,100 @@ class ODERegressionLMDBDataset(Dataset):
         }
 
 
+class ODERegressionPTDataset(Dataset):
+    """
+    Dataset for ODE trajectory samples saved as:
 
+        torch.save(
+            {
+                "states": Tensor,   # [1, T, F, C, H, W] or [T, F, C, H, W]
+                "prompt": str,
+                "seed": int,
+                "sample_id": int,
+            },
+            output_path,
+        )
+
+    Expected trajectory ordering:
+        [x_1000, x_937.5, x_833.33, x_625, x_0]
+
+    Returns:
+        {
+            "prompts": str,
+            "ode_latent": FloatTensor[T, F, C, H, W],
+            "seed": int,
+            "sample_id": int,
+        }
+    """
+    def __init__(
+        self,
+        data_path: str,
+        max_pair: int = int(1e8),
+    ):
+        self.data_path = Path(data_path)
+
+        if not self.data_path.exists():
+            raise FileNotFoundError(
+                f"Dataset path does not exist: {self.data_path}"
+            )
+
+        # Supports resume/incomplete dataset: only use existing .pt files.
+        self.files = sorted(
+            self.data_path.glob("*.pt"),
+            key=lambda p: int(p.stem),
+        )
+
+        if len(self.files) == 0:
+            raise RuntimeError(
+                f"No .pt samples found under {self.data_path}"
+            )
+
+        self.files = self.files[:max_pair]
+
+        # print(
+        #     f"Loaded ODE PT dataset from {self.data_path}, "
+        #     f"total {len(self.files)} samples."
+        # )
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        path = self.files[idx]
+
+        sample = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        latents = sample["states"]
+
+        #   [1, 5, 21, 16, 60, 104]
+        if latents.ndim == 6:
+            if latents.shape[0] != 1:
+                raise ValueError(
+                    f"Expected leading batch dimension = 1, "
+                    f"but got shape {tuple(latents.shape)} "
+                    f"in {path}"
+                )
+            latents = latents.squeeze(0)
+
+        if latents.ndim != 5:
+            raise ValueError(
+                f"Expected 5D ODE latent after squeeze, "
+                f"but got shape {tuple(latents.shape)} "
+                f"in {path}"
+            )
+        
+        latents = latents.to(dtype=torch.float32)
+
+        return {
+            "prompts": sample["prompt"],
+            "ode_latent": latents,
+            "seed": sample.get("seed", -1),
+            "sample_id": sample.get("sample_id", int(path.stem)),
+        }
 
 
 class LatentLMDBDataset(Dataset):
