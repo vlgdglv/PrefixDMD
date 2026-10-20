@@ -6,7 +6,8 @@ set -euo pipefail
 #          Edit RUN NAME Here!!
 #
 #----------------------------------------
-RUN_NAME=prefix_dmd_chunkwise/20261016_102726/checkpoint_model_000200
+RUN_NAME=prefix_dmd_chunkwise_onpolicy/checkpoint_model_000600
+
 
 NUM_SAMPLES=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +31,7 @@ SEED="${SEED:-0}"
 NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-21}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/self_gradient_forcing}"
 
-USE_EMA="${USE_EMA:-0}"
+USE_EMA="${USE_EMA:-1}"
 EMA_ARGS=()
 [[ "$USE_EMA" == "1" ]] && EMA_ARGS=(--use_ema)
 

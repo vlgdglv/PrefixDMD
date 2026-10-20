@@ -44,28 +44,36 @@ gradient_checkpointing: true
 sharding_strategy: hybrid_full
 
 lr: 2.0e-6
-lr_critic: 1.0e-06
-lr_real_critic: 1.0e-06
-lr_fake_critic: 1.0e-06
+lr_critic: 5.0e-07
+lr_real_critic: 5.0e-07
+lr_fake_critic: 2.0e-07
 beta1: 0.0
 beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
 ema_weight: 0.99
-ema_start_step: 200
-batch_size: 4
-dfake_gen_update_ratio: 2
-dreal_critic_update_ratio: 2
+ema_start_step: 300
+batch_size: 2
+dfake_gen_update_ratio: 3
+dreal_critic_update_ratio: 1
 seed: 42
-max_steps: 1500
-critic_warmup_step: 100
+trainable_realscore: true
 
+max_steps: 3000
+critic_warmup_step: 100
+anchor_first_chunk: false
 increase_low_noise: false
 low_noise_ratio: 0.0
 
 enable_online_rollout: false
 chunk_curriculum_steps: 100
 rollout_start_step: 500
+
+anchor_weight_gen: 1.0
+
+onpolicy_max_chunks: 3
+onpolicy_prob: 0.5
+onpolicy_start_step: 200 
 
 # generator_ckpt: training_outputs/teacher_forcing_dmd_chunkwise_curriculum_1015/checkpoint_model_000500/model.pt
 # starting_step: 505
@@ -89,7 +97,7 @@ wandb_host: https://api.wandb.ai
 wandb_key: {not here}
 wandb_entity: vlgunsdaddy
 wandb_project: PrefixDMD
-wandb_run_name: teacher_forcing_dmd_chunkwise
+wandb_run_name: teacher_forcing_dmd_chunkwise_onpolicy
 
 
 # ---------------------------------
@@ -97,7 +105,7 @@ wandb_run_name: teacher_forcing_dmd_chunkwise
 # ---------------------------------
 real_name: Wan2.1-T2V-1.3B
 fake_name: Wan2.1-T2V-1.3B
-guidance_scale: 6.0
+guidance_scale: 3.0
 negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
 image_or_video_shape:
 - 1

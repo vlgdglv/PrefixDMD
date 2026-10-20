@@ -6,7 +6,8 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 cd "$PROJECT_ROOT"
 
 CONFIG="${1:-configs/prefix_dmd_chunkwise.yaml}"
-LOGDIR="${2:-/bht/PrefixDMD/training_outputs/prefix_dmd_chunkwise}/$(date +%Y%m%d_%H%M%S)"
+LOGDIR="${2:-/bht/PrefixDMD/training_outputs/prefix_dmd_chunkwise_onpolicy}"
+# LOGDIR="${2:-/bht/PrefixDMD/training_outputs/prefix_dmd_chunkwise}/$(date +%Y%m%d_%H%M%S)"
 
 NUM_GPUS="${NUM_GPUS:-8}"
 MASTER_PORT="${MASTER_PORT:-29531}"

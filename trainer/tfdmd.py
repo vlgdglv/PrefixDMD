@@ -2,7 +2,7 @@ import gc
 import logging
 from utils.dataset import ODERegressionLMDBDataset, cycle, ODERegressionPTDataset
 from model import TeacherForcingDMD
-
+import random
 from collections import defaultdict
 from utils.misc import (
     set_seed
@@ -99,6 +99,10 @@ class Trainer:
         if not config.no_visualize or config.load_raw_video:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
+    
+        self.trainable_realscore = getattr(config, "trainable_realscore", True)
+        if not self.trainable_realscore:
+            print("NO update on real score.")
 
         self.generator_optimizer = torch.optim.AdamW(
             [param for param in self.model.generator.parameters()
@@ -114,13 +118,14 @@ class Trainer:
             betas=(config.beta1_critic, config.beta2_critic),
             weight_decay=config.weight_decay
         )
-        self.real_critic_optimizer = torch.optim.AdamW(
-            [param for param in self.model.real_score.parameters()
-             if param.requires_grad],
-            lr=config.lr_real_critic if hasattr(config, "lr_real_critic") else config.lr,
-            betas=(config.beta1_critic, config.beta2_critic),
-            weight_decay=config.weight_decay
-        )
+        if self.trainable_realscore:
+            self.real_critic_optimizer = torch.optim.AdamW(
+                [param for param in self.model.real_score.parameters()
+                if param.requires_grad],
+                lr=config.lr_real_critic if hasattr(config, "lr_real_critic") else config.lr,
+                betas=(config.beta1_critic, config.beta2_critic),
+                weight_decay=config.weight_decay
+            )
 
         # Step 3: Initialize the dataloader
         data_store_ext = getattr(config, "data_store_ext", "lmdb")
@@ -143,7 +148,7 @@ class Trainer:
             print(config)
         self.step = 0
         self.critic_warmup_step = getattr(config, "critic_warmup_step", 100)
-        self.save_critic = False
+        self.save_critic = True
         ##############################################################################################################
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
         if getattr(config, "generator_ckpt", False):
@@ -179,23 +184,23 @@ class Trainer:
         ##############################################################################################################
         # 6. Set up EMA parameter containers
         # No ema for now
-        # rename_param = (
-        #     lambda name: name.replace("_fsdp_wrapped_module.", "")
-        #     .replace("_checkpoint_wrapped_module.", "")
-        #     .replace("_orig_mod.", "")
-        # )
-        # self.name_to_trainable_params = {}
-        # for n, p in self.model.generator.named_parameters():
-        #     if not p.requires_grad:
-        #         continue
+        rename_param = (
+            lambda name: name.replace("_fsdp_wrapped_module.", "")
+            .replace("_checkpoint_wrapped_module.", "")
+            .replace("_orig_mod.", "")
+        )
+        self.name_to_trainable_params = {}
+        for n, p in self.model.generator.named_parameters():
+            if not p.requires_grad:
+                continue
 
-        #     renamed_n = rename_param(n)
-        #     self.name_to_trainable_params[renamed_n] = p
-        # ema_weight = config.ema_weight
+            renamed_n = rename_param(n)
+            self.name_to_trainable_params[renamed_n] = p
+        ema_weight = config.ema_weight
         self.generator_ema = None
-        # if (ema_weight is not None) and (ema_weight > 0.0):
-        #     print(f"Setting up EMA with weight {ema_weight}")
-        #     self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+        if (ema_weight is not None) and (ema_weight > 0.0):
+            print(f"Setting up EMA with weight {ema_weight}")
+            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
 
         self.max_grad_norm = 10.0
         self.previous_time = None
@@ -210,9 +215,15 @@ class Trainer:
     def save(self):
         print("Start gathering distributed model states...")
         generator_state_dict = fsdp_state_dict(self.model.generator)
-        state_dict = {
-            "generator": generator_state_dict
-        }
+        if self.config.ema_start_step < self.step:
+            state_dict = {
+                "generator_ema": self.generator_ema.full_state_dict(self.model.generator),
+            }
+        else:
+            state_dict = {
+                "generator": generator_state_dict,
+            }
+            
         if self.save_critic:
             critic_state_dict = {"critic": fsdp_state_dict(self.model.fake_score)}
 
@@ -226,23 +237,27 @@ class Trainer:
             if self.save_critic:
                 torch.save(critic_state_dict, os.path.join(self.output_path,
                         f"checkpoint_model_{self.step:06d}", "critic_model.pt"))
-            
+    
+    def _chunk_plan(self, ode_latent, weight_key):
+        total = ode_latent.shape[2] // self.model.num_frame_per_block   # ode_latent: [B, T_traj, F, C, H, W]
+        if not getattr(self.config, "anchor_first_chunk", False):
+            return [(None, 1.0)]
+        idx = 1 + self.model.sample_chunk_idx(self.step, total - 1)
+        return [(0, float(getattr(self.config, weight_key, 1.0))), (idx, 1.0)]
 
     def train_one_step_generator(self, ode_latent, conditional_dict, loss_scale=1.0):
         self.model.generator.train()
         self.model.real_score.eval()
         self.model.fake_score.eval()
+
         self.generator_optimizer.zero_grad(set_to_none=True)
-
-        # Train the generator
-        generator_loss, log_dict = self.model.generator_loss(
-            ode_latent=ode_latent,
-            conditional_dict=conditional_dict,
-            unconditional_dict=self.unconditional_dict,
-            global_step=self.step
-        )
-
-        (generator_loss * loss_scale).backward()
+        generator_loss = 0.0
+        for idx, w in self._chunk_plan(ode_latent, "anchor_weight_gen"):
+            loss, log_dict = self.model.generator_loss(
+                ode_latent=ode_latent, conditional_dict=conditional_dict,
+                unconditional_dict=self.unconditional_dict, global_step=self.step, chunk_idx=idx)
+            (loss * w).backward()
+            generator_loss = generator_loss + loss.detach()
         generator_grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm)
         self.generator_optimizer.step()
 
@@ -268,13 +283,18 @@ class Trainer:
         self.model.fake_score.eval()
         self.real_critic_optimizer.zero_grad(set_to_none=True)
 
-        critic_loss, critic_log_dict = self.model.real_critic_loss(
-            ode_latent, 
-            conditional_dict,
-            global_step=self.step
-        )
-
-        (critic_loss * loss_scale).backward()
+        p = getattr(self.config, "real_cond_dropout", 0.0)
+        if p > 0 and hasattr(self, "unconditional_dict") and random.random() < p:
+            conditional_dict = self.unconditional_dict
+        
+        critic_loss = 0.0
+        for idx, w in self._chunk_plan(ode_latent, "anchor_weight_gen"):
+            loss, critic_log_dict = self.model.real_critic_loss(
+                ode_latent=ode_latent, conditional_dict=conditional_dict,
+                # unconditional_dict=self.unconditional_dict, 
+                global_step=self.step, chunk_idx=idx)
+            (loss * w).backward()
+            critic_loss = critic_loss + loss.detach()
         critic_grad_norm = self.model.real_score.clip_grad_norm_(self.max_grad_norm)
         self.real_critic_optimizer.step()
 
@@ -305,13 +325,14 @@ class Trainer:
         self.model.real_score.eval()
         self.fake_critic_optimizer.zero_grad(set_to_none=True)
 
-        critic_loss, critic_log_dict = self.model.fake_critic_loss(
-            ode_latent, 
-            conditional_dict,
-            global_step=self.step
-        )
-
-        (critic_loss * loss_scale).backward()
+        critic_loss = 0.0
+        for idx, w in self._chunk_plan(ode_latent, "anchor_weight_gen"):
+            loss, critic_log_dict = self.model.fake_critic_loss(
+                ode_latent=ode_latent, conditional_dict=conditional_dict,
+                # unconditional_dict=self.unconditional_dict, 
+                global_step=self.step, chunk_idx=idx)
+            (loss * w).backward()
+            critic_loss = critic_loss + loss.detach()
         critic_grad_norm = self.model.fake_score.clip_grad_norm_(self.max_grad_norm)
         self.fake_critic_optimizer.step()
 
@@ -346,16 +367,17 @@ class Trainer:
             self.unconditional_dict = self.model.text_encoder(
                 text_prompts=[self.config.negative_prompt] * batch_size
             )
+            self.model.unconditional_dict = self.unconditional_dict
 
         if self.is_main_process:
             eta_times = deque(maxlen=50)
             eta_last_time = time.perf_counter()
             
         while max_steps < 0 or self.step < max_steps:
-            critic_warmup = self.step < self.critic_warmup_step
+            critic_warmup = self.trainable_realscore and self.step < self.critic_warmup_step
             do_train_generator = not critic_warmup and self.step > 0 and self.step % self.config.dfake_gen_update_ratio == 0
-            do_train_real_critic =  self.step > 0 and self.step % self.config.dreal_critic_update_ratio == 0
             do_train_fake_critic = True
+            do_train_real_critic = self.trainable_realscore and self.step > 0 and self.step % self.config.dreal_critic_update_ratio == 0
             
             # Get the next batch of text prompts
             batch = next(self.dataloader)

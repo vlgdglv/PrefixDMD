@@ -18,6 +18,7 @@ class TeacherForcingDMD(nn.Module):
         self.dtype = torch.bfloat16 if args.mixed_precision else torch.float32
         
         # Initialize models.
+        self.trainable_realscore = getattr(args, "trainable_realscore", True)
         self.iscausal = getattr(args, "causal", True)
         self.timestep_shift = getattr(args, "timestep_shift", 5.0)
         self.critic_timestep_shift = getattr(args, "critic_timestep_shift", self.timestep_shift)
@@ -30,7 +31,7 @@ class TeacherForcingDMD(nn.Module):
 
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, timestep_shift=self.timestep_shift, is_causal=False)
-        self.real_score.model.requires_grad_(True)
+        self.real_score.model.requires_grad_(self.trainable_realscore)
         # self.real_score.to(device=self.device, dtype=self.dtype)
         
         self.text_encoder = WanTextEncoder()
@@ -78,7 +79,8 @@ class TeacherForcingDMD(nn.Module):
         if args.gradient_checkpointing:
             self.generator.enable_gradient_checkpointing()
             self.fake_score.enable_gradient_checkpointing()
-            self.real_score.enable_gradient_checkpointing()
+            if self.trainable_realscore:
+                self.real_score.enable_gradient_checkpointing()
 
         self.real_guidance_scale = getattr(args, "guidance_scale", 5.0)
         self.ts_schedule = getattr(args, "ts_schedule", True)
@@ -103,7 +105,8 @@ class TeacherForcingDMD(nn.Module):
         self,
         ode_latent: torch.Tensor,
         conditional_dict: dict,
-        global_step
+        global_step,
+        chunk_idx=None
     ):
         # [B, T, C, H, W]
         clean_latent = ode_latent[:, -1]
@@ -121,7 +124,8 @@ class TeacherForcingDMD(nn.Module):
 
         # dist.broadcast(chunk_idx, src=0)
         # chunk_idx = int(chunk_idx.item())
-        chunk_idx = self.sample_chunk_idx(global_step, total_chunks)
+        if chunk_idx is None:
+            chunk_idx = self.sample_chunk_idx(global_step, total_chunks)
         
         ctx_end = chunk_idx * self.num_frame_per_block
         x_ctx = clean_latent[:, :ctx_end]
@@ -190,7 +194,8 @@ class TeacherForcingDMD(nn.Module):
         self,
         ode_latent: torch.Tensor,
         conditional_dict: dict,
-        global_step
+        global_step,
+        chunk_idx=None
     ):
         # [B, T, C, H, W]
         clean_latent = ode_latent[:, -1]
@@ -209,10 +214,12 @@ class TeacherForcingDMD(nn.Module):
         # dist.broadcast(chunk_idx, src=0)
         # chunk_idx = int(chunk_idx.item())
         
-        chunk_idx = self.sample_chunk_idx(global_step, total_chunks)
+        if chunk_idx is None:
+            chunk_idx = self.sample_chunk_idx(global_step, total_chunks)
         
         ctx_end = chunk_idx * self.num_frame_per_block
-        x_ctx = clean_latent[:, :ctx_end]
+        # x_ctx = clean_latent[:, :ctx_end]
+        x_ctx = self.build_context(clean_latent, chunk_idx, conditional_dict, global_step)
         current_gt = clean_latent[:, ctx_end:ctx_end + self.num_frame_per_block]
 
         # --------------------------------------------------
@@ -290,7 +297,8 @@ class TeacherForcingDMD(nn.Module):
         ode_latent: torch.Tensor,
         conditional_dict: dict,
         unconditional_dict: dict,
-        global_step
+        global_step,
+        chunk_idx=None
     ):
         # Teacher synthetic PF-ODE endpoint.
         clean_latent = ode_latent[:, -1] # [B, 21, C, H, W]
@@ -305,10 +313,12 @@ class TeacherForcingDMD(nn.Module):
         # chunk_idx = int(chunk_idx.item())
         total_chunks = clean_latent.shape[1] // self.num_frame_per_block
         
-        chunk_idx = self.sample_chunk_idx(global_step, total_chunks)
+        if chunk_idx is None:
+            chunk_idx = self.sample_chunk_idx(global_step, total_chunks)
         
         ctx_end = chunk_idx * self.num_frame_per_block
-        x_ctx = clean_latent[:, :ctx_end]
+        # x_ctx = clean_latent[:, :ctx_end]
+        x_ctx = self.build_context(clean_latent, chunk_idx, conditional_dict, global_step)
 
         use_rollout = (
             getattr(self.args, "enable_online_rollout", False) and
@@ -380,12 +390,20 @@ class TeacherForcingDMD(nn.Module):
 
         with torch.no_grad():
             # 4. bidirectional Real score
-            _, pred_real_prefix = self.real_score(
+            _, pred_real_cond = self.real_score(
                 noisy_image_or_video=prefix_tau,
-                conditional_dict=conditional_dict,
-                timestep=score_timestep,
+                conditional_dict=conditional_dict, 
+                timestep=score_timestep
             )
-            
+            if self.real_guidance_scale != 1.0:
+                _, pred_real_uncond = self.real_score(
+                    noisy_image_or_video=prefix_tau,
+                    conditional_dict=unconditional_dict, 
+                    timestep=score_timestep
+                )
+                pred_real_prefix = pred_real_uncond + self.real_guidance_scale * (pred_real_cond - pred_real_uncond)
+            else:
+                pred_real_prefix = pred_real_cond
             pred_real = pred_real_prefix[:, -self.num_frame_per_block:]
 
             # --------------------------------------------------
@@ -663,3 +681,29 @@ class TeacherForcingDMD(nn.Module):
             return tau.clamp(t_min, t_max)
         else:
             return tau_base.clamp(t_min, t_max)
+        
+    def _onpolicy_plan(self, global_step, chunk_idx):
+        p = float(getattr(self.args, "onpolicy_prob", 0.0))
+        if p <= 0 or chunk_idx == 0 or global_step < getattr(self.args, "onpolicy_start_step", 0):
+            return 0
+        g = torch.Generator(device="cpu")
+        g.manual_seed(1000003 * global_step + 17)
+        if torch.rand(1, generator=g).item() >= p:
+            return 0
+        max_r = min(int(getattr(self.args, "onpolicy_max_chunks", 4)), chunk_idx)
+        return int(torch.randint(1, max_r + 1, (1,), generator=g).item())
+
+    @torch.no_grad()
+    def build_context(self, clean_latent, chunk_idx, conditional_dict, global_step):
+        block = self.num_frame_per_block
+        ctx_end = chunk_idx * block
+        r = self._onpolicy_plan(global_step, chunk_idx)
+        if r == 0:
+            return clean_latent[:, :ctx_end]
+        ctx = clean_latent[:, :ctx_end - r * block]
+        for j in range(chunk_idx - r, chunk_idx):
+            noise = torch.randn_like(clean_latent[:, j * block:(j + 1) * block])
+            x_j = self.four_step_generate_with_grad(
+                initial_noise=noise, conditional_dict=conditional_dict, clean_context=ctx)
+            ctx = torch.cat([ctx, x_j], dim=1)
+        return ctx
