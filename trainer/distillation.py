@@ -41,10 +41,10 @@ class Trainer:
         set_seed(config.seed + global_rank)
 
         if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
+            wandb.login(host=config.wandb_host)
             wandb.init(
                 config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
+                name=config.wandb_run_name,
                 mode="online",
                 entity=config.wandb_entity,
                 project=config.wandb_project,
@@ -128,6 +128,13 @@ class Trainer:
             print("DATASET SIZE %d" % len(dataset))
         self.dataloader = cycle(dataloader)
 
+        # [GRAD-ACCUM] micro-batches per optimizer step (default 1 = original Self Forcing behavior)
+        self.grad_accum_steps = max(1, int(getattr(config, "grad_accum_steps", 1)))
+        # if self.is_main_process:
+        print(f"[Trainer] grad_accum_steps={self.grad_accum_steps}, "
+                f"effective batch = {config.batch_size} x {self.world_size} GPUs x {self.grad_accum_steps} "
+                f"= {config.batch_size * self.world_size * self.grad_accum_steps}")
+
         ##############################################################################################################
         # 6. Set up EMA parameter containers
         rename_param = (
@@ -174,6 +181,8 @@ class Trainer:
             self.model.generator.load_state_dict(
                 state_dict, strict=True
             )
+        
+        # if getattr(config, "critic_ckpt": )
 
         ##############################################################################################################
 
@@ -226,7 +235,9 @@ class Trainer:
             print("Model saved to", os.path.join(self.output_path,
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
             
-    def fwdbwd_one_step(self, batch, train_generator, clean_latent=None):
+    def fwdbwd_one_step(self, batch, train_generator, clean_latent=None, loss_scale=1.0):
+        # [GRAD-ACCUM] this function now only does forward + (loss * loss_scale).backward().
+        # Gradient clipping is moved to train(), after all micro-batches are accumulated.
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
         if self.step % 20 == 0:
@@ -270,12 +281,8 @@ class Trainer:
                 initial_latent=image_latent if self.config.i2v else None
             )
            
-            generator_loss.backward()
-            generator_grad_norm = self.model.generator.clip_grad_norm_(
-                self.max_grad_norm_generator)
-
-            generator_log_dict.update({"generator_loss": generator_loss,
-                                       "generator_grad_norm": generator_grad_norm})
+            (generator_loss * loss_scale).backward()                     # [GRAD-ACCUM] scaled, no clip here
+            generator_log_dict.update({"generator_loss": generator_loss.detach()})
 
             return generator_log_dict
         else:
@@ -290,40 +297,61 @@ class Trainer:
             initial_latent=image_latent if self.config.i2v else None
         )
 
-        critic_loss.backward()
-        critic_grad_norm = self.model.fake_score.clip_grad_norm_(
-            self.max_grad_norm_critic)
-
-        critic_log_dict.update({"critic_loss": critic_loss,
-                                "critic_grad_norm": critic_grad_norm})
+        (critic_loss * loss_scale).backward()                            # [GRAD-ACCUM] scaled, no clip here
+        critic_log_dict.update({"critic_loss": critic_loss.detach()})
 
         return critic_log_dict
 
+    @staticmethod
+    def _merge_logs(logs):
+        # [GRAD-ACCUM] average logged values over micro-batches (for logging only)
+        merged = {}
+        for k in logs[0]:
+            vals = [l[k] for l in logs if k in l]
+            if torch.is_tensor(vals[0]):
+                merged[k] = torch.stack([v.detach().float().mean() for v in vals]).mean()
+            else:
+                merged[k] = vals[-1]
+        return merged
 
     def train(self):
+        max_steps = int(getattr(self.config, "max_steps", -1))
         start_step = self.step
+        accum = self.grad_accum_steps
        
-        while True:
+        while max_steps < 0 or self.step < max_steps:
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
 
             # Train the generator
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
-                
-                batch = next(self.dataloader)
-                generator_log_dict = self.fwdbwd_one_step(batch, True)
+
+                # [GRAD-ACCUM] accumulate over `accum` micro-batches, then clip once and step once
+                logs = []
+                for _ in range(accum):
+                    batch = next(self.dataloader)
+                    logs.append(self.fwdbwd_one_step(batch, True, loss_scale=1.0 / accum))
+                generator_grad_norm = self.model.generator.clip_grad_norm_(
+                    self.max_grad_norm_generator)
+                generator_log_dict = self._merge_logs(logs)
+                generator_log_dict["generator_grad_norm"] = generator_grad_norm
 
                 self.generator_optimizer.step()
                 if self.generator_ema is not None:
                     self.generator_ema.update(self.model.generator)
-                
-                
-                
 
             # Train the critic
             self.critic_optimizer.zero_grad(set_to_none=True)
-            batch = next(self.dataloader)
-            critic_log_dict = self.fwdbwd_one_step(batch, False)
+
+            # [GRAD-ACCUM] same pattern for the critic
+            logs = []
+            for _ in range(accum):
+                batch = next(self.dataloader)
+                logs.append(self.fwdbwd_one_step(batch, False, loss_scale=1.0 / accum))
+            critic_grad_norm = self.model.fake_score.clip_grad_norm_(
+                self.max_grad_norm_critic)
+            critic_log_dict = self._merge_logs(logs)
+            critic_log_dict["critic_grad_norm"] = critic_grad_norm
                 
             self.critic_optimizer.step()
 
@@ -359,6 +387,9 @@ class Trainer:
                         "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
                     }
                 )
+
+                log_str = "  ".join(f"{k}: {v:.4f}" for k, v in wandb_loss_dict.items())
+                print(f"[step {self.step}] {log_str}", flush=True)
 
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)

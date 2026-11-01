@@ -1,0 +1,129 @@
+trainer: teacher_forcing_dmd
+ode_data_format: causvid
+
+# ---------------------------------
+# Raw Wan initialization
+# ---------------------------------
+# intentionally NO generator_ckpt
+
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+generator_task: causal_video
+
+model_kwargs:
+  model_name: Wan2.1-T2V-1.3B
+  timestep_shift: 5.0
+
+timestep_shift: 5.0
+# critic_timestep_shift: 5.0
+
+num_frame_per_block: 3
+independent_first_frame: false
+
+# ---------------------------------
+# ODE / rollout
+# ---------------------------------
+warmup_rollout_steps: 1000
+
+denoising_step_list:
+  - 1000
+  - 750
+  - 500
+  - 250
+
+warp_denoising_step: true
+context_noise: 0
+
+# ---------------------------------
+# Optimization
+# ---------------------------------
+mixed_precision: true
+gradient_checkpointing: true
+sharding_strategy: hybrid_full
+
+lr: 2.0e-6
+lr_critic: 5.0e-07
+lr_real_critic: 5.0e-7
+lr_fake_critic: 6.0e-7
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+ema_weight: 0.99
+ema_start_step: 10
+batch_size: 2
+dfake_gen_update_ratio: 3
+dreal_critic_update_ratio: 1
+seed: 42
+trainable_realscore: true
+
+max_steps: 1500
+critic_warmup_step: 10
+
+increase_low_noise: false
+low_noise_ratio: 0.0
+
+enable_online_rollout: false
+chunk_curriculum_steps: 100
+rollout_start_step: 500
+
+anchor_first_chunk: false
+anchor_weight_gen: 1.0
+
+onpolicy_prob: 0.8
+onpolicy_max_chunks: 4
+onpolicy_start_step: 10
+
+mixed_timestep_critic: true
+critic_context_timestep: 0.0
+
+real_score_cfg: true
+guidance_scale: 3.0
+
+dfd_prob: 0.0
+dfd_start_step: 1200 
+
+native_length_critic: true
+
+generator_ckpt: training_outputs/prefix_dmd_chunkwise_fulllength/checkpoint_model_001800/model.pt
+critic_ckpt: training_outputs/prefix_dmd_chunkwise_fulllength/checkpoint_model_001800/critic_model.pt
+real_critic_ckpt: training_outputs/prefix_dmd_chunkwise_fulllength/checkpoint_model_001800/real_critic_model.pt
+
+# starting_step: 505
+
+# ---------------------------------
+# Data
+# ---------------------------------
+data_path: dataset/vidprom_sample_16k
+max_pair: 16000
+load_raw_video: false
+data_store_ext: pt
+
+# ---------------------------------
+# Logging/checkpoints
+# ---------------------------------
+log_iters: 200
+gc_interval: 20
+console_print_interval: 1
+
+wandb_host: https://api.wandb.ai
+wandb_key: {not here}
+wandb_entity: vlgunsdaddy
+wandb_project: PrefixDMD
+wandb_run_name: prefix_dmd_chunkwise_onpolicy
+
+
+# ---------------------------------
+# Additional configs
+# ---------------------------------
+real_name: Wan2.1-T2V-1.3B
+fake_name: Wan2.1-T2V-1.3B
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104

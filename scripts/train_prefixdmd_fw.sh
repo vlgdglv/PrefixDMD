@@ -6,7 +6,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 cd "$PROJECT_ROOT"
 
 CONFIG="${1:-configs/prefix_dmd_framewise.yaml}"
-LOGDIR="${2:-/bht/PrefixDMD/training_outputs/prefix_dmd_framewise_onpolicy}"
+LOGDIR="${2:-/bht/PrefixDMD/training_outputs/prefix_dmd_framewise_fulllength}"
 # LOGDIR="${2:-/bht/PrefixDMD/training_outputs/prefix_dmd_framewise}/$(date +%Y%m%d_%H%M%S)"
 
 NUM_GPUS="${NUM_GPUS:-8}"

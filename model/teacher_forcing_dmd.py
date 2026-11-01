@@ -40,10 +40,10 @@ class TeacherForcingDMD(nn.Module):
         self.vae = WanVAEWrapper()
         self.vae.requires_grad_(False)
         
-        if getattr(args, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {args.generator_ckpt}")
-            state_dict = torch.load(args.generator_ckpt, map_location="cpu")['generator']
-            self.generator.load_state_dict(state_dict, strict=True)
+        # if getattr(args, "generator_ckpt", False):
+        #     print(f"Loading pretrained generator from {args.generator_ckpt}")
+        #     state_dict = torch.load(args.generator_ckpt, map_location="cpu")['generator']
+        #     self.generator.load_state_dict(state_dict, strict=True)
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
 
@@ -67,6 +67,12 @@ class TeacherForcingDMD(nn.Module):
         else:
             self.denoising_step_list_first_chunk = None
 
+        self.mixed_timestep_critic = getattr(args, "mixed_timestep_critic", False)
+        self.context_timestep = float(getattr(args, "critic_context_timestep", 0.0))
+        if self.mixed_timestep_critic:
+            self.real_score.uniform_timestep = False
+            self.fake_score.uniform_timestep = False
+            
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.same_step_across_blocks = getattr(args, "same_step_across_blocks", True)
         self.num_training_frames = getattr(args, "num_training_frames", 21)
@@ -82,6 +88,7 @@ class TeacherForcingDMD(nn.Module):
             if self.trainable_realscore:
                 self.real_score.enable_gradient_checkpointing()
 
+        self.real_score_cfg = getattr(args, "real_score_cfg", False)
         self.real_guidance_scale = getattr(args, "guidance_scale", 5.0)
         self.ts_schedule = getattr(args, "ts_schedule", True)
         self.ts_schedule_max = getattr(args, "ts_schedule_max", False)
@@ -141,47 +148,47 @@ class TeacherForcingDMD(nn.Module):
         # 3. Sample critic timestep
         # --------------------------------------------------
         tau = self.sample_timestep(batch_size=batch_size, t_min=self.sample_min_ts, t_max=self.sample_max_ts)
-        critic_timestep = tau.repeat(1, prefix_frames)
-
+        critic_timestep = self._critic_timestep(tau, prefix_frames)
+        
         # --------------------------------------------------
         # 4. Add noise to the whole prefix
         # --------------------------------------------------
         critic_noise = torch.randn_like(prefix_real, dtype=self.dtype, device=self.device)
-
-        prefix_tau = self.scheduler.add_noise(
-            prefix_real.flatten(0, 1),
-            critic_noise.flatten(0, 1),
-            critic_timestep.flatten(0, 1),
-        ).unflatten(0, prefix_real.shape[:2])
+        prefix_tau = self._noise_prefix(prefix_real, critic_noise, critic_timestep)
 
         # --------------------------------------------------
         # 5. Bidirectional fake critic
         # --------------------------------------------------
-        _, pred_real_prefix = self.real_score(
-            noisy_image_or_video=prefix_tau,
-            conditional_dict=conditional_dict,
-            timestep=critic_timestep,
+        # _, pred_real_prefix = self.real_score(
+        #     noisy_image_or_video=prefix_tau,
+        #     conditional_dict=conditional_dict,
+        #     timestep=critic_timestep,
+        # )
+        pred_real_prefix = self._critic_forward(
+            self.real_score, 
+            prefix_tau,
+            conditional_dict, 
+            critic_timestep
         )
 
         # --------------------------------------------------
         # 6. x0 prediction -> flow prediction
         # --------------------------------------------------
+        leaf = slice(-self.num_frame_per_block, None)
         flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
-                scheduler=self.scheduler,
-                x0_pred=pred_real_prefix.flatten(0, 1),
-                xt=prefix_tau.flatten(0, 1),
-                timestep=critic_timestep.flatten(0, 1),
-            ).unflatten(0, prefix_real.shape[:2])
-        
-
+            scheduler=self.scheduler,
+            x0_pred=pred_real_prefix[:, leaf].flatten(0, 1),
+            xt=prefix_tau[:, leaf].flatten(0, 1),
+            timestep=critic_timestep[:, leaf].flatten(0, 1),
+        ).unflatten(0, (batch_size, self.num_frame_per_block))
+       
         # Wan flow-matching target: v* = eps - x0
-        flow_target = critic_noise - prefix_real
-
+        flow_target = (critic_noise - prefix_real)[:, leaf]
+        
         # --------------------------------------------------
         # 7. ONLY optimize generated leaf
         # --------------------------------------------------
-        leaf = slice(-self.num_frame_per_block, None)
-        loss = F.mse_loss(flow_pred[:, leaf].float(), flow_target[:, leaf].float())
+        loss = F.mse_loss(flow_pred.float(), flow_target.float())
 
         log_dict = {
             "real_critic_loss": loss.detach().item(),
@@ -243,41 +250,42 @@ class TeacherForcingDMD(nn.Module):
         # 3. Sample critic timestep
         # --------------------------------------------------
         tau = self.sample_timestep(batch_size=batch_size, t_min=self.sample_min_ts, t_max=self.sample_max_ts)
-        critic_timestep = tau.repeat(1, prefix_frames)
-
+        critic_timestep = self._critic_timestep(tau, prefix_frames)
+        
         # --------------------------------------------------
         # 4. Add noise to the whole prefix
         # --------------------------------------------------
         critic_noise = torch.randn_like(prefix_fake, dtype=self.dtype, device=self.device)
-
-        prefix_tau = self.scheduler.add_noise(
-            prefix_fake.flatten(0, 1),
-            critic_noise.flatten(0, 1),
-            critic_timestep.flatten(0, 1),
-        ).unflatten(0, prefix_fake.shape[:2])
+        prefix_tau = self._noise_prefix(prefix_fake, critic_noise, critic_timestep)
 
         # --------------------------------------------------
         # 5. Bidirectional fake critic
         # --------------------------------------------------
-        _, pred_fake_prefix = self.fake_score(
-            noisy_image_or_video=prefix_tau,
-            conditional_dict=conditional_dict,
-            timestep=critic_timestep,
+        # _, pred_fake_prefix = self.fake_score(
+        #     noisy_image_or_video=prefix_tau,
+        #     conditional_dict=conditional_dict,
+        #     timestep=critic_timestep,
+        # )
+        pred_fake_prefix = self._critic_forward(
+            self.fake_score, 
+            prefix_tau,
+            conditional_dict, 
+            critic_timestep
         )
 
         # --------------------------------------------------
         # 6. x0 prediction -> flow prediction
         # --------------------------------------------------
+        leaf = slice(-self.num_frame_per_block, None)
         flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
-                scheduler=self.scheduler,
-                x0_pred=pred_fake_prefix.flatten(0, 1),
-                xt=prefix_tau.flatten(0, 1),
-                timestep=critic_timestep.flatten(0, 1),
-            ).unflatten(0, prefix_fake.shape[:2])
-        
-
+            scheduler=self.scheduler,
+            x0_pred=pred_fake_prefix[:, leaf].flatten(0, 1),
+            xt=prefix_tau[:, leaf].flatten(0, 1),
+            timestep=critic_timestep[:, leaf].flatten(0, 1),
+        ).unflatten(0, (batch_size, self.num_frame_per_block))
+       
         # Wan flow-matching target: v* = eps - x0
-        flow_target = critic_noise - prefix_fake
+        flow_target = (critic_noise - prefix_fake)[:, leaf]
 
         # --------------------------------------------------
         # 7. ONLY optimize generated leaf
@@ -377,30 +385,41 @@ class TeacherForcingDMD(nn.Module):
 
         # 3. independent DMD timestep
         tau = self.sample_timestep(batch_size=batch_size, t_min=self.sample_min_ts, t_max=self.sample_max_ts)
-
+        score_timestep = self._critic_timestep(tau, prefix_clean.shape[1])
         noise = torch.randn_like(prefix_clean, dtype=self.dtype, device=self.device)
+        prefix_tau = self._noise_prefix(prefix_clean, noise, score_timestep)
 
-        prefix_tau = self.scheduler.add_noise(
-            prefix_clean.flatten(0, 1),
-            noise.flatten(0, 1),
-            tau.repeat(1, prefix_clean.shape[1]).flatten(0, 1),
-        ).unflatten(0, prefix_clean.shape[:2])
-        
-        score_timestep = tau.repeat(1, prefix_tau.shape[1])
+        dfd_p = float(getattr(self.args, "dfd_prob", 0.0))
+        use_dfd = False
+        if (dfd_p > 0 and global_step >= getattr(self.args, "dfd_start_step", 0)
+                and self._onpolicy_plan(global_step, chunk_idx) == 0):
+            g = torch.Generator(device="cpu")
+            g.manual_seed(7777 * global_step + 31 * chunk_idx + 3)
+            use_dfd = torch.rand(1, generator=g).item() < dfd_p
 
+        if use_dfd:
+            gt_leaf = clean_latent[:, ctx_end:ctx_end + self.num_frame_per_block]
+            prefix_real_tau = self._noise_prefix(torch.cat([score_context, gt_leaf], dim=1), noise, score_timestep)
+        else:
+            prefix_real_tau = prefix_tau
+            
         with torch.no_grad():
-            # 4. bidirectional Real score
-            _, pred_real_cond = self.real_score(
-                noisy_image_or_video=prefix_tau,
-                conditional_dict=conditional_dict, 
-                timestep=score_timestep
-            )
+            
+            n_f = self.num_training_frames - prefix_tau.shape[1]
+            fut = torch.randn((batch_size, n_f, *prefix_tau.shape[2:]), device=self.device, dtype=prefix_tau.dtype) \
+                if (getattr(self.args, "native_length_critic", False) and n_f > 0) else None
+                
+            
+            pred_real_cond = self._critic_forward(self.real_score, prefix_real_tau, conditional_dict,   score_timestep, fut)
+            
             if self.real_guidance_scale != 1.0:
-                _, pred_real_uncond = self.real_score(
-                    noisy_image_or_video=prefix_tau,
-                    conditional_dict=unconditional_dict, 
-                    timestep=score_timestep
-                )
+                # _, pred_real_uncond = self.real_score(
+                #     noisy_image_or_video=prefix_real_tau,
+                #     conditional_dict=unconditional_dict, 
+                #     timestep=score_timestep
+                # )
+                pred_real_uncond = self._critic_forward(self.real_score, prefix_real_tau, unconditional_dict, score_timestep, fut)  # 仅在 CFG 开启时
+            
                 pred_real_prefix = pred_real_uncond + self.real_guidance_scale * (pred_real_cond - pred_real_uncond)
             else:
                 pred_real_prefix = pred_real_cond
@@ -409,12 +428,12 @@ class TeacherForcingDMD(nn.Module):
             # --------------------------------------------------
             # 5. causal SELF fake-score
             # --------------------------------------------------
-            _, pred_fake_prefix = self.fake_score(
-                noisy_image_or_video=prefix_tau,
-                conditional_dict=conditional_dict,
-                timestep=score_timestep,
-            )
-
+            # _, pred_fake_prefix = self.fake_score(
+            #     noisy_image_or_video=prefix_tau,
+            #     conditional_dict=conditional_dict,
+            #     timestep=score_timestep,
+            # )
+            pred_fake_prefix = self._critic_forward(self.fake_score, prefix_tau,      conditional_dict,   score_timestep, fut)
             pred_fake = pred_fake_prefix[:, -self.num_frame_per_block:]
 
         # 6. DMD gradient
@@ -445,6 +464,17 @@ class TeacherForcingDMD(nn.Module):
         }
 
         return loss, log_dict
+    
+    def _critic_forward(self, critic, x_tau, cond, t, fut=None):
+        F_p = x_tau.shape[1]
+        n_f = self.num_training_frames - F_p
+        if getattr(self.args, "native_length_critic", False) and n_f > 0:
+            if fut is None:
+                fut = torch.randn((x_tau.shape[0], n_f, *x_tau.shape[2:]), device=x_tau.device, dtype=x_tau.dtype)
+            x_tau = torch.cat([x_tau, fut], dim=1)
+            t = torch.cat([t, torch.full((t.shape[0], n_f), 1000.0, device=t.device, dtype=t.dtype)], dim=1)
+        _, x0 = critic(noisy_image_or_video=x_tau, conditional_dict=cond, timestep=t)
+        return x0[:, :F_p]
 
     def four_step_generate_with_grad(
         self,
@@ -707,3 +737,23 @@ class TeacherForcingDMD(nn.Module):
                 initial_noise=noise, conditional_dict=conditional_dict, clean_context=ctx)
             ctx = torch.cat([ctx, x_j], dim=1)
         return ctx
+
+    def _critic_timestep(self, tau, prefix_frames):
+        t = tau.repeat(1, prefix_frames)
+        if self.mixed_timestep_critic:
+            n = self.num_frame_per_block
+            t = torch.cat([torch.full_like(t[:, :-n], self.context_timestep), t[:, -n:]], dim=1)
+        return t
+
+    def _noise_prefix(self, prefix, noise, timestep):
+        if not self.mixed_timestep_critic:
+            return self.scheduler.add_noise(prefix.flatten(0, 1), noise.flatten(0, 1),
+                                            timestep.flatten(0, 1)).unflatten(0, prefix.shape[:2])
+        n = self.num_frame_per_block
+        leaf = self.scheduler.add_noise(prefix[:, -n:].flatten(0, 1), noise[:, -n:].flatten(0, 1),
+                                        timestep[:, -n:].flatten(0, 1)).unflatten(0, (prefix.shape[0], n))
+        ctx = prefix[:, :-n]
+        if self.context_timestep > 0 and ctx.shape[1] > 0:
+            ctx = self.scheduler.add_noise(ctx.flatten(0, 1), noise[:, :-n].flatten(0, 1),
+                                        timestep[:, :-n].flatten(0, 1)).unflatten(0, ctx.shape[:2])
+        return torch.cat([ctx, leaf.to(prefix.dtype)], dim=1)

@@ -6,7 +6,7 @@ set -euo pipefail
 #          Edit RUN NAME Here!!
 #
 #----------------------------------------
-RUN_NAME=prefix_dmd_framewise_onpolicy/checkpoint_model_000800
+RUN_NAME=prefix_dmd_framewise_fulllength/checkpoint_model_002000
 
 NUM_SAMPLES=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

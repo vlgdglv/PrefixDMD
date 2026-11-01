@@ -330,6 +330,18 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
+        # Very simple patch: mixed timestep
+        if e.dim() == 4:
+            F_ = e.shape[1]
+            e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2) # [B, F, 1, C]
+            mod  = lambda h, sh, sc: (h.unflatten(1, (F_, -1)) * (1 + sc) + sh).flatten(1, 2)
+            gate = lambda h, g: (h.unflatten(1, (F_, -1)) * g).flatten(1, 2)
+            y = self.self_attn(mod(self.norm1(x), e[0], e[1]), seq_lens, grid_sizes, freqs)
+            x = x + gate(y, e[2])
+            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            y = self.ffn(mod(self.norm2(x), e[3], e[4]))
+            return x + gate(y, e[5])
+        
         # assert e.dtype == torch.float32
         # with amp.autocast(dtype=torch.float32):
         e = (self.modulation + e).chunk(6, dim=1)
@@ -459,6 +471,13 @@ class Head(nn.Module):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, C]
         """
+        # Very simple patch: mixed timestep
+        if e.dim() == 3:
+            F_ = e.shape[1]
+            e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2) # [B, F, 1, C]
+            h = self.norm(x).unflatten(1, (F_, -1)) * (1 + e[1]) + e[0]
+            return self.head(h.flatten(1, 2))
+
         # assert e.dtype == torch.float32
         # with amp.autocast(dtype=torch.float32):
         e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
@@ -693,10 +712,23 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t).type_as(x))
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+        # e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).type_as(x))
+        # e0 = self.time_projection(e).unflatten(1, (6, self.dim))
         # assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        if t.dim() == 2: # per frame timestep [B, F]
+            B_, F_t = t.shape
+            frame_seqlen = int(grid_sizes[0][1] * grid_sizes[0][2])
+            assert seq_len % frame_seqlen == 0
+            F_pad = seq_len // frame_seqlen
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x)).unflatten(0, (B_, F_t))   # [B, F, C]
+            e0 = self.time_projection(e).unflatten(2, (6, self.dim)) # [B, F, 6, C]
+            if F_pad > F_t:
+                e  = torch.cat([e,  e[:, -1:].expand(-1, F_pad - F_t, -1)], dim=1)
+                e0 = torch.cat([e0, e0[:, -1:].expand(-1, F_pad - F_t, -1, -1)], dim=1)
+        else:
+            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).type_as(x))
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
         # context
         context_lens = None

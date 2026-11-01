@@ -231,13 +231,15 @@ class SelfForcingTrainingPipeline:
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
 
             # Step 3.3: rerun with timestep zero to update the cache
-            context_timestep = torch.ones_like(timestep) * self.context_noise
+            context_timestep = torch.ones(
+                [batch_size, current_num_frames],
+                device=noise.device,
+                dtype=torch.int64) * self.context_noise
             # add context noise
             denoised_pred = self.scheduler.add_noise(
                 denoised_pred.flatten(0, 1),
                 torch.randn_like(denoised_pred.flatten(0, 1)),
-                context_timestep * torch.ones(
-                    [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
+                context_timestep
             ).unflatten(0, denoised_pred.shape[:2])
             with torch.no_grad():
                 self.generator(

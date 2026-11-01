@@ -6,8 +6,11 @@ set -euo pipefail
 #          Edit RUN NAME Here!!
 #
 #----------------------------------------
-RUN_NAME=prefix_dmd_chunkwise_onpolicy/checkpoint_model_000600
-
+# RUN_NAME=asymmetic_dmd_chunkwise/20261031_023008/checkpoint_model_001600
+# RUN_NAME=prefix_dmd_chunkwise_onpolicy/20261030_011958/checkpoint_model_001500
+# RUN_NAME=prefix_dmd_chunkwise_fulllength/checkpoint_model_001800
+# RUN_NAME=asymmetic_dmd_chunkwise_cfode_init/checkpoint_model_000800
+RUN_NAME=asymmetic_dmd_chunkwise_bs64/checkpoint_model_000200
 
 NUM_SAMPLES=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,6 +19,7 @@ cd "$PROJECT_ROOT"
 
 CONFIG="${CONFIG:-configs/infer_chunkwise_common.yaml}"
 CKPT="${1:-training_outputs/${RUN_NAME}/model.pt}"
+
 
 [[ $# -gt 0 ]] && shift
 
@@ -31,7 +35,7 @@ SEED="${SEED:-0}"
 NUM_OUTPUT_FRAMES="${NUM_OUTPUT_FRAMES:-21}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/self_gradient_forcing}"
 
-USE_EMA="${USE_EMA:-1}"
+USE_EMA="${USE_EMA:-0}"
 EMA_ARGS=()
 [[ "$USE_EMA" == "1" ]] && EMA_ARGS=(--use_ema)
 

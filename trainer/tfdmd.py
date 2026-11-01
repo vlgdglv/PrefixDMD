@@ -67,6 +67,76 @@ class Trainer:
             print("[TFDMD Trainer] cls: ", model_cls)
         self.model = model_cls(config, device=self.device)
         
+        
+        # 3.  Load the model if provided
+        if getattr(config, "generator_ckpt", False):
+            if getattr(config, "starting_step", 0) != 0:
+                self.step = config.starting_step
+                print(f"Resuming from step: {self.step}!!")
+            
+            print(f"Loading pretrained generator from {config.generator_ckpt}")
+            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
+            if "generator" in state_dict:
+                state_dict = state_dict["generator"]
+                fixed = {}
+                for k, v in state_dict.items():
+                    if k.startswith("model._fsdp_wrapped_module."):
+                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                    fixed[k] = v
+                state_dict = fixed
+            elif "model" in state_dict:
+                state_dict = state_dict["model"]
+            elif "generator_ema" in state_dict:
+                gen_sd = state_dict["generator_ema"]
+                fixed = {}
+                for k, v in gen_sd.items():
+                    if k.startswith("model._fsdp_wrapped_module."):
+                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                    fixed[k] = v
+                state_dict = fixed
+            self.model.generator.load_state_dict(
+                state_dict, strict=True
+            )
+
+        if getattr(config, "critic_ckpt", False):
+            if self.is_main_process:
+                print(f"Loading fake critic from {config.critic_ckpt}")
+            state_dict = torch.load(config.critic_ckpt, map_location="cpu")
+            if "critic" in state_dict:
+                state_dict = state_dict["critic"]
+                fixed = {}
+                for k, v in state_dict.items():
+                    if k.startswith("model._fsdp_wrapped_module."):
+                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                    fixed[k] = v
+                state_dict = fixed
+            else:
+                raise NotImplementedError
+            self.model.fake_score.load_state_dict(
+                state_dict, strict=True
+            )
+            
+        if getattr(config, "real_critic_ckpt", False):
+            if self.is_main_process:
+                print(f"Loading real critic from {config.real_critic_ckpt}")
+            state_dict = torch.load(config.real_critic_ckpt, map_location="cpu")
+            if "real_critic" in state_dict:
+                state_dict = state_dict["real_critic"]
+                fixed = {}
+                for k, v in state_dict.items():
+                    if k.startswith("model._fsdp_wrapped_module."):
+                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                    fixed[k] = v
+                state_dict = fixed
+            else:
+                raise NotImplementedError
+            self.model.real_score.load_state_dict(
+                state_dict, strict=True
+            )
+        
+        
+        self.warmup_fake_score = not bool(getattr(config, "critic_ckpt", None))
+
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
@@ -150,37 +220,7 @@ class Trainer:
         self.critic_warmup_step = getattr(config, "critic_warmup_step", 100)
         self.save_critic = True
         ##############################################################################################################
-        # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
-        if getattr(config, "generator_ckpt", False):
-            if getattr(config, "starting_step", 0) != 0:
-                self.step = config.starting_step
-                print(f"Resuming from step: {self.step}!!")
-            
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-            if "generator" in state_dict:
-                state_dict = state_dict["generator"]
-                fixed = {}
-                for k, v in state_dict.items():
-                    if k.startswith("model._fsdp_wrapped_module."):
-                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
-                    fixed[k] = v
-                state_dict = fixed
-            elif "model" in state_dict:
-                state_dict = state_dict["model"]
-            elif "generator_ema" in state_dict:
-                gen_sd = state_dict["generator_ema"]
-                fixed = {}
-                for k, v in gen_sd.items():
-                    if k.startswith("model._fsdp_wrapped_module."):
-                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
-                    fixed[k] = v
-                state_dict = fixed
-            self.model.generator.load_state_dict(
-                state_dict, strict=True
-            )
-
-
+        
         ##############################################################################################################
         # 6. Set up EMA parameter containers
         # No ema for now
@@ -198,12 +238,18 @@ class Trainer:
             self.name_to_trainable_params[renamed_n] = p
         ema_weight = config.ema_weight
         self.generator_ema = None
-        if (ema_weight is not None) and (ema_weight > 0.0):
-            print(f"Setting up EMA with weight {ema_weight}")
-            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+        # later
+        # if (ema_weight is not None) and (ema_weight > 0.0):
+        #     print(f"Setting up EMA with weight {ema_weight}")
+        #     self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
 
         self.max_grad_norm = 10.0
         self.previous_time = None
+
+        if getattr(config, "onpolicy_prob", 0.0) > 0 and getattr(config, "onpolicy_max_chunks", 1):
+            print(f"Using on policy with probablity {config.onpolicy_prob} and max chunk {config.onpolicy_max_chunks}")
+        if getattr(config, "dfd_prob", 0.0) > 0:
+            print(f"Using on Data-Forcing with probablity {config.dfd_prob}")
 
     def _debug(self, msg):
         print(
@@ -212,7 +258,7 @@ class Trainer:
             flush=True,
         )
         
-    def save(self):
+    def save(self, save_real_score=True):
         print("Start gathering distributed model states...")
         generator_state_dict = fsdp_state_dict(self.model.generator)
         if self.config.ema_start_step < self.step:
@@ -223,9 +269,11 @@ class Trainer:
             state_dict = {
                 "generator": generator_state_dict,
             }
-            
+        
         if self.save_critic:
             critic_state_dict = {"critic": fsdp_state_dict(self.model.fake_score)}
+        if save_real_score:
+            real_critic_state_dict = {"real_critic": fsdp_state_dict(self.model.real_score)}
 
         if self.is_main_process:
             os.makedirs(os.path.join(self.output_path,
@@ -237,6 +285,10 @@ class Trainer:
             if self.save_critic:
                 torch.save(critic_state_dict, os.path.join(self.output_path,
                         f"checkpoint_model_{self.step:06d}", "critic_model.pt"))
+            if save_real_score:
+                torch.save(real_critic_state_dict, os.path.join(self.output_path,
+                        f"checkpoint_model_{self.step:06d}", "real_critic_model.pt"))
+                
     
     def _chunk_plan(self, ode_latent, weight_key):
         total = ode_latent.shape[2] // self.model.num_frame_per_block   # ode_latent: [B, T_traj, F, C, H, W]
@@ -374,9 +426,9 @@ class Trainer:
             eta_last_time = time.perf_counter()
             
         while max_steps < 0 or self.step < max_steps:
-            critic_warmup = self.trainable_realscore and self.step < self.critic_warmup_step
+            critic_warmup = self.step < self.critic_warmup_step
             do_train_generator = not critic_warmup and self.step > 0 and self.step % self.config.dfake_gen_update_ratio == 0
-            do_train_fake_critic = True
+            do_train_fake_critic = (critic_warmup and self.warmup_fake_score) or (not critic_warmup)
             do_train_real_critic = self.trainable_realscore and self.step > 0 and self.step % self.config.dreal_critic_update_ratio == 0
             
             # Get the next batch of text prompts
@@ -397,8 +449,11 @@ class Trainer:
             # Train the generator
             if do_train_generator:
                 self.train_one_step_generator(ode_latent, conditional_dict)
-                if self.generator_ema is not None:
-                    self.generator_ema.update(self.model.generator)
+                if self.config.ema_weight > 0 and self.step >= self.config.ema_start_step:
+                    if self.generator_ema is None:
+                        self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+                    else:
+                        self.generator_ema.update(self.model.generator)
 
             if (not self.config.no_save) and self.step % self.config.log_iters == 0 and self.step > 0:
                 self.save()
@@ -436,3 +491,4 @@ class Trainer:
                         f"Remaining: {timedelta(seconds=int(eta_seconds))}",
                         flush=True,
                     )
+        self.save(save_real_score=True)
