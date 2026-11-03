@@ -246,6 +246,7 @@ class BidirectionalVBenchInferencePipeline(torch.nn.Module):
         context_latent: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         return_latents: bool = False,
+        context_noise: int = 0, 
         show_progress: bool = True,
         frame_num: int = 21,
         frame_per_chunk: int = 3,
@@ -274,10 +275,17 @@ class BidirectionalVBenchInferencePipeline(torch.nn.Module):
             frame_end = (cid + 1) * frame_per_chunk
 
             latents[:, frame_start:] = torch.randn_like(latents[:, frame_start:],  device=self.device, dtype=self.dtype, generator=generator)
+            ctx = context_latent[:, :frame_start]
+            
             for t in tqdm(self.scheduler.timesteps, disable=not show_progress):
-
+                if frame_start > 0 and context_noise > 0:
+                    latents[:, :frame_start] = self.scheduler.add_noise(
+                        ctx.flatten(0, 1), torch.randn_like(ctx.flatten(0, 1)),
+                        torch.full([ctx.shape[0] * frame_start], float(context_noise), device=self.device)
+                    ).unflatten(0, ctx.shape[:2])
+                
                 timestep = torch.cat([
-                    torch.full((1, frame_start), 0,  device=self.device, dtype=torch.float32), 
+                    torch.full((1, frame_start), context_noise,  device=self.device, dtype=torch.float32), 
                     torch.full((1, frame_per_chunk), t,  device=self.device, dtype=torch.float32), 
                     torch.full((1, 21 - frame_end), 1000.,  device=self.device, dtype=torch.float32)
                     ],dim=1)

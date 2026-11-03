@@ -68,6 +68,7 @@ parser.add_argument("--model_name", type=str, default="Wan2.1-T2V-1.3B")
 parser.add_argument("--timestep_shift", type=float, default=5.0)
 parser.add_argument("--num_inference_steps", type=int, default=48)
 parser.add_argument("--guidance_scale", type=float, default=6.0)
+parser.add_argument("--context_noise", type=float, default=0)
 parser.add_argument("--num_samples", type=int, default=5, help="VBench's standard protocol asks for 5 videos per prompt.")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--use_ema", action="store_true")
@@ -180,7 +181,7 @@ for batch in tqdm(dataloader, disable=(local_rank != 0)):
                 show_progress=(local_rank == 0),
                 frame_num=args.num_output_frames,
                 frame_per_chunk=args.frame_per_chunk,
-
+                context_noise=args.context_noise,
             )
             current_video = rearrange(video, "b t c h w -> b t h w c").cpu()
             current_video = (255.0 * current_video).clamp(0, 255).to(torch.uint8)

@@ -59,7 +59,7 @@ dreal_critic_update_ratio: 1
 seed: 42
 trainable_realscore: true
 
-max_steps: 3000
+max_steps: 2500
 critic_warmup_step: 200
 
 increase_low_noise: false
@@ -80,7 +80,9 @@ mixed_timestep_critic: true
 critic_context_timestep: 0.0
 
 real_score_cfg: true
-guidance_scale: 3.0
+guidance_scale: 6.0
+
+real_cond_dropout: 0.1
 
 dfd_prob: 0.0
 dfd_start_step: 1200 

@@ -47,6 +47,13 @@ parser.add_argument("--seed", type=int, default=42, help="Random seed")
 parser.add_argument("--num_samples", type=int, default=1, help="Number of samples generated per prompt")
 parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (or T2V by default)")
 parser.add_argument("--report_timing", action="store_true", help="Report per-sample latency and throughput for the current hardware.")
+parser.add_argument(
+    "--dimension_prompt_path", type=str, default=None,
+    help="Optional path to a single-dimension VBench prompt subset file (one prompt per line). When given, "
+         "the full --data_path dataset is pruned down to only the prompts that also appear in this subset "
+         "(matched by exact prompt text); only that dimension's videos are generated. The inference loop "
+         "itself is unchanged -- this only trims which prompts the dataset yields.",
+)
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -122,6 +129,16 @@ else:
 num_prompts = len(dataset)
 print(f"Number of prompts: {num_prompts}")
 
+if args.dimension_prompt_path and args.dimension_prompt_path != "" :
+    with open(args.dimension_prompt_path, encoding="utf-8") as f:
+        dimension_prompts = {line.rstrip() for line in f}
+    matched_indices = [i for i, p in enumerate(dataset.prompt_list) if p in dimension_prompts]
+    unmatched = dimension_prompts - {dataset.prompt_list[i] for i in matched_indices}
+    if unmatched:
+        print(f"[WARN] {len(unmatched)} prompt(s) in --dimension_prompt_path were not found in --data_path (exact-text match).")
+    print(f"[dimension_prompt_path] {args.dimension_prompt_path}: pruned dataset {len(dataset)} -> {len(matched_indices)} prompts")
+    dataset = Subset(dataset, matched_indices)
+    
 if args.report_timing and num_prompts < 2:
     print(f"[WARN] --report_timing requires at least 2 prompts "
           f"(got {num_prompts}); timing disabled.")
@@ -214,7 +231,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     sample_report_timing = args.report_timing and i >= 1
 
     for sample_idx in range(args.num_samples):
-        file_name = f"{prompt[:args.name_length]}-{sample_idx}.mp4" if args.name_length != -1 else f"{prompt}-{sample_idx}.mp4" 
+        file_name = f"{prompt[:args.name_length]}.mp4" if args.name_length != -1 else f"{prompt}-{sample_idx}.mp4" 
         output_path = os.path.join(args.output_folder, file_name)
 
         if os.path.exists(output_path):
