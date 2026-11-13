@@ -210,21 +210,34 @@ class CausalWanSelfAttention(nn.Module):
                 # in this attention call and is NOT written into the cache.
                 # ------------------------------------------------------
                 # print("KV Cache NOT update.")
-                local_end = kv_cache["local_end_index"].item()
+                # local_end = kv_cache["local_end_index"].item()
+                # num_new_tokens = roped_key.shape[1]
+                # if self.local_attn_size == -1:
+                #     cached_k = kv_cache["k"][:, :local_end]
+                #     cached_v = kv_cache["v"][:, :local_end]
+                # else:
+                #     # Match the normal inference behavior:
+                #     # total context + current should stay inside max_attention_size.
+                #     num_ctx_keep = max(self.max_attention_size - num_new_tokens,0,)
+                #     ctx_start = max(local_end - num_ctx_keep, 0,)
+                #     cached_k = kv_cache["k"][:, ctx_start:local_end]
+                #     cached_v = kv_cache["v"][:, ctx_start:local_end]
+
+                # attn_k = torch.cat([cached_k.detach(), roped_key], dim=1,)
+                # attn_v = torch.cat([cached_v.detach(), v], dim=1,)
+                local_end = current_start
                 num_new_tokens = roped_key.shape[1]
                 if self.local_attn_size == -1:
                     cached_k = kv_cache["k"][:, :local_end]
                     cached_v = kv_cache["v"][:, :local_end]
                 else:
-                    # Match the normal inference behavior:
-                    # total context + current should stay inside max_attention_size.
-                    num_ctx_keep = max(self.max_attention_size - num_new_tokens,0,)
-                    ctx_start = max(local_end - num_ctx_keep, 0,)
+                    num_ctx_keep = max(self.max_attention_size - num_new_tokens, 0)
+                    ctx_start = max(local_end - num_ctx_keep, 0)
                     cached_k = kv_cache["k"][:, ctx_start:local_end]
                     cached_v = kv_cache["v"][:, ctx_start:local_end]
 
-                attn_k = torch.cat([cached_k.detach(), roped_key], dim=1,)
-                attn_v = torch.cat([cached_v.detach(), v], dim=1,)
+                attn_k = torch.cat([cached_k, roped_key], dim=1) 
+                attn_v = torch.cat([cached_v, v], dim=1)
 
                 x = attention(
                     roped_query,

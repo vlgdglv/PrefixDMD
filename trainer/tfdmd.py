@@ -43,7 +43,15 @@ class Trainer:
             dist.broadcast(random_seed, src=0)
             config.seed = random_seed.item()
 
-        set_seed(config.seed)
+        # [FIX-1] Each rank must draw its OWN noise / tau. With set_seed(config.seed) on every rank,
+        # all 8 GPUs sample identical tau, generation noise, critic noise and future padding each step,
+        # so the DMD / critic estimators only see `batch_size` distinct noise draws instead of
+        # batch_size * world_size. Self Forcing uses seed + rank. Everything that must be rank-consistent
+        # (chunk_idx, on-policy plan, DFD switch) already uses its own step-seeded torch.Generator.
+        if getattr(config, "per_rank_seed", True):
+            set_seed(config.seed + global_rank)
+        else:
+            set_seed(config.seed)
 
         if self.is_main_process and not self.disable_wandb:
             wandb.login(host=config.wandb_host)
@@ -73,8 +81,8 @@ class Trainer:
             if getattr(config, "starting_step", 0) != 0:
                 self.step = config.starting_step
                 print(f"Resuming from step: {self.step}!!")
-            
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
+            if self.is_main_process:
+                print(f"Loading pretrained generator from {config.generator_ckpt}")
             state_dict = torch.load(config.generator_ckpt, map_location="cpu")
             if "generator" in state_dict:
                 state_dict = state_dict["generator"]
@@ -135,7 +143,10 @@ class Trainer:
             )
         
         
-        self.warmup_fake_score = not bool(getattr(config, "critic_ckpt", None))
+        # [FIX-3] When a critic ckpt is loaded the fake critic used to be frozen during warmup.
+        # If the critic input changes (e.g. window_chunks 1 -> 2) it must re-adapt: set fake_critic_warmup: true.
+        self.warmup_fake_score = bool(getattr(config, "fake_critic_warmup",
+                                              not bool(getattr(config, "critic_ckpt", None))))
 
         self.model.generator = fsdp_wrap(
             self.model.generator,
@@ -216,9 +227,19 @@ class Trainer:
             print(f"[Trainer] Dataset loaded. {len(dataset)} entries in total.")
             print(f"[Trainer] full config: ")
             print(config)
-        self.step = 0
+        # [FIX-2] do NOT reset self.step here: it silently discarded `starting_step`.
+        # self.step is 0 unless starting_step was given together with generator_ckpt.
         self.critic_warmup_step = getattr(config, "critic_warmup_step", 100)
         self.save_critic = True
+
+        # [GRAD-ACCUM] micro-batches per optimizer step (1 = original behaviour)
+        self.grad_accum_steps = max(1, int(getattr(config, "grad_accum_steps", 1)))
+        if self.is_main_process:
+            print(f"[Trainer] grad_accum_steps={self.grad_accum_steps}, effective batch = "
+                  f"{config.batch_size} x {self.world_size} x {self.grad_accum_steps} = "
+                  f"{config.batch_size * self.world_size * self.grad_accum_steps}; "
+                  f"per_rank_seed={getattr(config, 'per_rank_seed', True)}; "
+                  f"fake_critic_warmup={self.warmup_fake_score}; start step={self.step}")
         ##############################################################################################################
         
         ##############################################################################################################
@@ -260,16 +281,22 @@ class Trainer:
         
     def save(self, save_real_score=True):
         print("Start gathering distributed model states...")
-        generator_state_dict = fsdp_state_dict(self.model.generator)
-        if self.config.ema_start_step < self.step:
+        # [FIX-5] guard: EMA may not exist (ema_weight=0, or no generator update since ema_start_step);
+        # the old code crashed with generator_ema=None. model.pt keeps the old semantics
+        # (EMA if it exists, raw generator otherwise) so eval scripts behave as before.
+        use_ema = (self.generator_ema is not None) and (self.config.ema_start_step < self.step)
+        raw_generator_state_dict = None
+        if use_ema:
             state_dict = {
                 "generator_ema": self.generator_ema.full_state_dict(self.model.generator),
             }
+            if getattr(self.config, "save_raw_generator", False):
+                raw_generator_state_dict = {"generator": fsdp_state_dict(self.model.generator)}
         else:
             state_dict = {
-                "generator": generator_state_dict,
+                "generator": fsdp_state_dict(self.model.generator),
             }
-        
+
         if self.save_critic:
             critic_state_dict = {"critic": fsdp_state_dict(self.model.fake_score)}
         if save_real_score:
@@ -281,7 +308,10 @@ class Trainer:
             torch.save(state_dict, os.path.join(self.output_path,
                        f"checkpoint_model_{self.step:06d}", "model.pt"))
             print("Model saved to", os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}",  "model.pt"))
-            
+            if raw_generator_state_dict is not None:                           # [FIX-5] for resuming training
+                torch.save(raw_generator_state_dict, os.path.join(self.output_path,
+                           f"checkpoint_model_{self.step:06d}", "generator_raw.pt"))
+
             if self.save_critic:
                 torch.save(critic_state_dict, os.path.join(self.output_path,
                         f"checkpoint_model_{self.step:06d}", "critic_model.pt"))
@@ -297,20 +327,63 @@ class Trainer:
         idx = 1 + self.model.sample_chunk_idx(self.step, total - 1)
         return [(0, float(getattr(self.config, weight_key, 1.0))), (idx, 1.0)]
 
-    def train_one_step_generator(self, ode_latent, conditional_dict, loss_scale=1.0):
+    # [GRAD-ACCUM] fetch K micro-batches once per step; shared by real critic / fake critic / generator
+    def _get_micro_batches(self):
+        micro_batches = []
+        for _ in range(self.grad_accum_steps):
+            batch = next(self.dataloader)
+            ode_latent = batch["ode_latent"].to(device=self.device, dtype=self.dtype)
+            with torch.no_grad():
+                conditional_dict = self.model.text_encoder(text_prompts=batch["prompts"])
+            micro_batches.append((ode_latent, conditional_dict))
+        return micro_batches
+
+    def train_one_step_generator(self, micro_batches, loss_scale=1.0):
         self.model.generator.train()
         self.model.real_score.eval()
         self.model.fake_score.eval()
 
+        accum = len(micro_batches)
         self.generator_optimizer.zero_grad(set_to_none=True)
         generator_loss = 0.0
-        for idx, w in self._chunk_plan(ode_latent, "anchor_weight_gen"):
-            loss, log_dict = self.model.generator_loss(
-                ode_latent=ode_latent, conditional_dict=conditional_dict,
-                unconditional_dict=self.unconditional_dict, global_step=self.step, chunk_idx=idx)
-            (loss * w).backward()
-            generator_loss = generator_loss + loss.detach()
-        generator_grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm)
+        for ode_latent, conditional_dict in micro_batches:                  # [GRAD-ACCUM]
+
+            # print("#### Checking 1: Gradient flowing in context ")
+            # # Check 1:
+            # for flag in [True, False]:
+            #     torch.manual_seed(0); 
+            #     self.model.window_history_grad = flag
+            #     self.model.generator.zero_grad(set_to_none=True)
+            #     loss, _ = self.model.generator_loss(ode_latent, conditional_dict, self.unconditional_dict, global_step=10**6, chunk_idx=2)
+            #     loss.backward()
+            #     g = torch.cat([p.grad.flatten().float() for p in self.model.generator.parameters() if p.grad is not None])
+            #     if self.is_main_process:
+            #         print("ck1: ", flag, loss.item(), g.norm().item())
+
+            # print("#### Checking 1 done.")
+
+            # print("#### Checking 2: gradient checkpointing ")
+            # # Check 2:
+            # for ckpt in [True, False]:
+            #     torch.manual_seed(0); 
+            #     self.model.generator.model.gradient_checkpointing = ckpt
+            #     torch.manual_seed(0); self.model.generator.zero_grad(set_to_none=True)
+            #     loss, _ = self.model.generator_loss(ode_latent, conditional_dict, self.unconditional_dict, global_step=10**6, chunk_idx=0)
+            #     loss.backward()
+            #     g = torch.cat([p.grad.flatten().float() for p in self.model.generator.parameters() if p.grad is not None])
+            #     if self.is_main_process:
+            #         print("ck2: ", ckpt, loss.item(), g.norm().item())
+            # print("#### Checking 2 done.")
+                
+            for idx, w in self._chunk_plan(ode_latent, "anchor_weight_gen"):
+                loss, log_dict = self.model.generator_loss(
+                    ode_latent=ode_latent, conditional_dict=conditional_dict,
+                    unconditional_dict=self.unconditional_dict, global_step=self.step, chunk_idx=idx)
+                
+                # Normal backward
+                (loss * w / accum).backward()
+                generator_loss = generator_loss + loss.detach() / accum
+        generator_grad_norm = self.model.generator.clip_grad_norm_(self.max_grad_norm)   # clip once, after accumulation
         self.generator_optimizer.step()
 
         # Logging
@@ -322,31 +395,43 @@ class Trainer:
                     "chunk_idx": log_dict["chunk_idx"],
                 }
                 wandb.log(wandb_loss_dict, step=self.step)
-                if self.step % 25 == 0:
+                if getattr(self.config, "use_tf_loss", False):
+                    tf_loss = log_dict["tf_loss"]
+                    dmd_loss = log_dict["dmd_loss"]
+                    print("Step: ", self.step, ", generator_loss: ", generator_loss.item(), "generator_grad_norm: ", generator_grad_norm.item(),
+                     "dmd_loss", dmd_loss.item(), "tf_loss: ", tf_loss.item(), "chunk_idx: ", log_dict["chunk_idx"])
+                else:
                     print("Step: ", self.step, ", generator_loss: ", generator_loss.item(), "generator_grad_norm: ", generator_grad_norm.item(), "chunk_idx: ", log_dict["chunk_idx"])
             elif self.step % self.config.console_print_interval == 0:
-                print("Step: ", self.step, ", generator_loss: ", generator_loss.item(), "generator_grad_norm: ", generator_grad_norm.item(), "chunk_idx: ", log_dict["chunk_idx"])
+                if getattr(self.config, "use_tf_loss", False):
+                    tf_loss = log_dict["tf_loss"]
+                    dmd_loss = log_dict["dmd_loss"]
+                    print("Step: ", self.step, ", generator_loss: ", generator_loss.item(), "generator_grad_norm: ", generator_grad_norm.item(),
+                     "dmd_loss", dmd_loss.item(), "tf_loss: ", tf_loss.item(), "chunk_idx: ", log_dict["chunk_idx"])
+                else:
+                    print("Step: ", self.step, ", generator_loss: ", generator_loss.item(), "generator_grad_norm: ", generator_grad_norm.item(), "chunk_idx: ", log_dict["chunk_idx"])
             else:
                 pass
 
-    def train_one_step_real_critic(self, ode_latent, conditional_dict, loss_scale=1.0):
+    def train_one_step_real_critic(self, micro_batches, loss_scale=1.0):
         self.model.real_score.train()
         self.model.generator.eval()
         self.model.fake_score.eval()
         self.real_critic_optimizer.zero_grad(set_to_none=True)
 
         p = getattr(self.config, "real_cond_dropout", 0.0)
-        if p > 0 and hasattr(self, "unconditional_dict") and random.random() < p:
-            conditional_dict = self.unconditional_dict
-        
+        accum = len(micro_batches)
         critic_loss = 0.0
-        for idx, w in self._chunk_plan(ode_latent, "anchor_weight_gen"):
-            loss, critic_log_dict = self.model.real_critic_loss(
-                ode_latent=ode_latent, conditional_dict=conditional_dict,
-                # unconditional_dict=self.unconditional_dict, 
-                global_step=self.step, chunk_idx=idx)
-            (loss * w).backward()
-            critic_loss = critic_loss + loss.detach()
+        for ode_latent, conditional_dict in micro_batches:                     # [GRAD-ACCUM]
+            # [FIX-6] the dropped-condition embedding is configurable (see self.dropout_dict in train())
+            if p > 0 and random.random() < p:
+                conditional_dict = self.dropout_dict
+            for idx, w in self._chunk_plan(ode_latent, "anchor_weight_critic"):   # [FIX-4] critic weight key
+                loss, critic_log_dict = self.model.real_critic_loss(
+                    ode_latent=ode_latent, conditional_dict=conditional_dict,
+                    global_step=self.step, chunk_idx=idx)
+                (loss * w / accum).backward()
+                critic_loss = critic_loss + loss.detach() / accum
         critic_grad_norm = self.model.real_score.clip_grad_norm_(self.max_grad_norm)
         self.real_critic_optimizer.step()
 
@@ -371,20 +456,21 @@ class Trainer:
             else:
                 pass
 
-    def train_one_step_fake_critic(self, ode_latent, conditional_dict, loss_scale=1.0):
+    def train_one_step_fake_critic(self, micro_batches, loss_scale=1.0):
         self.model.fake_score.train()
         self.model.generator.eval()
         self.model.real_score.eval()
         self.fake_critic_optimizer.zero_grad(set_to_none=True)
 
+        accum = len(micro_batches)
         critic_loss = 0.0
-        for idx, w in self._chunk_plan(ode_latent, "anchor_weight_gen"):
-            loss, critic_log_dict = self.model.fake_critic_loss(
-                ode_latent=ode_latent, conditional_dict=conditional_dict,
-                # unconditional_dict=self.unconditional_dict, 
-                global_step=self.step, chunk_idx=idx)
-            (loss * w).backward()
-            critic_loss = critic_loss + loss.detach()
+        for ode_latent, conditional_dict in micro_batches:                     # [GRAD-ACCUM]
+            for idx, w in self._chunk_plan(ode_latent, "anchor_weight_critic"):   # [FIX-4] critic weight key
+                loss, critic_log_dict = self.model.fake_critic_loss(
+                    ode_latent=ode_latent, conditional_dict=conditional_dict,
+                    global_step=self.step, chunk_idx=idx)
+                (loss * w / accum).backward()
+                critic_loss = critic_loss + loss.detach() / accum
         critic_grad_norm = self.model.fake_score.clip_grad_norm_(self.max_grad_norm)
         self.fake_critic_optimizer.step()
 
@@ -420,7 +506,15 @@ class Trainer:
                 text_prompts=[self.config.negative_prompt] * batch_size
             )
             self.model.unconditional_dict = self.unconditional_dict
-
+            # [FIX-6] which embedding real_cond_dropout trains as "unconditional":
+            #   "negative" (default, = old behaviour): trains exactly the uncond branch used by CFG in generator_loss
+            #   "empty": trains the empty-prompt branch (keeps the negative prompt's anti-static push untouched)
+            if getattr(self.config, "real_cond_dropout_prompt", "negative") == "empty":
+                self.dropout_dict = self.model.text_encoder(text_prompts=[""] * batch_size)
+            else:
+                self.dropout_dict = self.unconditional_dict
+        
+        
         if self.is_main_process:
             eta_times = deque(maxlen=50)
             eta_last_time = time.perf_counter()
@@ -431,24 +525,18 @@ class Trainer:
             do_train_fake_critic = (critic_warmup and self.warmup_fake_score) or (not critic_warmup)
             do_train_real_critic = self.trainable_realscore and self.step > 0 and self.step % self.config.dreal_critic_update_ratio == 0
             
-            # Get the next batch of text prompts
-            batch = next(self.dataloader)
-            text_prompts = batch["prompts"]
-            ode_latent = batch["ode_latent"].to(device=self.device, dtype=self.dtype)
-                
-            # Extract the conditional infos
-            with torch.no_grad():
-                conditional_dict = self.model.text_encoder(text_prompts=text_prompts)
-            
+            # [GRAD-ACCUM] K micro-batches per step (K=1 reproduces the original single-batch behaviour)
+            micro_batches = self._get_micro_batches()
+
             if do_train_real_critic:
-                self.train_one_step_real_critic(ode_latent, conditional_dict)
+                self.train_one_step_real_critic(micro_batches)
 
             if do_train_fake_critic:
-                self.train_one_step_fake_critic(ode_latent, conditional_dict)
+                self.train_one_step_fake_critic(micro_batches)
 
             # Train the generator
             if do_train_generator:
-                self.train_one_step_generator(ode_latent, conditional_dict)
+                self.train_one_step_generator(micro_batches)
                 if self.config.ema_weight > 0 and self.step >= self.config.ema_start_step:
                     if self.generator_ema is None:
                         self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)

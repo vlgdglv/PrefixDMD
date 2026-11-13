@@ -193,6 +193,11 @@ class Trainer:
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
+        
+        if self.is_main_process:
+            print(f"[Trainer] Dataset loaded. {len(dataset)} entries in total.")
+            print(f"[Trainer] full config: ")
+            print(config)
 
     def save(self):
         print("Start gathering distributed model states...")

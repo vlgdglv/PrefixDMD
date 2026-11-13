@@ -54,6 +54,7 @@ parser.add_argument(
          "(matched by exact prompt text); only that dimension's videos are generated. The inference loop "
          "itself is unchanged -- this only trims which prompts the dataset yields.",
 )
+parser.add_argument("--save_latent", action="store_true")
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -269,3 +270,12 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         # Clear VAE cache
         pipeline.vae.model.clear_cache()
         write_video(output_path, current_video[0], fps=16)
+        
+        if args.save_latent:
+            print("Latent saved, shape: ", latents.shape)
+            obj = {
+                "latent": latents.cpu(),
+                "prompt": prompt,
+            }
+            torch.save(obj, os.path.join(args.output_folder, f"latents_{idx}.pt"))
+        

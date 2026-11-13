@@ -115,7 +115,7 @@ pipeline = BidirectionalVBenchInferencePipeline(
     latent_shape=(args.num_output_frames, 16, 60, 104),
 )
 if args.checkpoint_path:
-    pipeline.load_generator_checkpoint(args.checkpoint_path, use_ema=args.use_ema, key="real_critic")
+    pipeline.load_generator_checkpoint(args.checkpoint_path, use_ema=args.use_ema, key="critic")
 
 pipeline = pipeline.to(device=device, dtype=getattr(torch, args.dtype))
 pipeline.generator.eval()

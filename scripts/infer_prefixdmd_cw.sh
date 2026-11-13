@@ -6,11 +6,17 @@ set -euo pipefail
 #          Edit RUN NAME Here!!
 #
 #----------------------------------------
-# RUN_NAME=asymmetic_dmd_chunkwise/20261031_023008/checkpoint_model_001600
+# RUN_NAME=asymmetic_dmd_chunkwise/20261030_002034/checkpoint_model_000800
 # RUN_NAME=prefix_dmd_chunkwise_onpolicy/20261030_011958/checkpoint_model_001500
-RUN_NAME=prefix_dmd_chunkwise_fulllength_20261102_182907//checkpoint_model_001000
-# RUN_NAME=asymmetic_dmd_chunkwise_cfode_init/checkpoint_model_000800
+# RUN_NAME=asymmetic_dmd_chunkwise/20261104_161201/checkpoint_model_000400
+# RUN_NAME=asymmetic_dmd_chunkwise/20261109_155716/checkpoint_model_000700
 # RUN_NAME=asymmetic_dmd_chunkwise_bs64/checkpoint_model_001000
+# RUN_NAME=prefix_dmd_chunkwise_2window_20261105_194027/checkpoint_model_000800
+# RUN_NAME=prefix_dmd_chunkwise_2window_dfd//checkpoint_model_000400
+# RUN_NAME=asymmetic_dmd_chunkwise/20261110_092847/checkpoint_model_001000
+RUN_NAME=asymmetic_dmd_chunkwise/20261111_001838/checkpoint_model_000800
+# RUN_NAME=prefix_dmd_chunkwise_tfloss/20261107_011145/checkpoi nt_model_002000
+
 
 NUM_SAMPLES=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,7 +60,7 @@ PY
 if (( GPU_COUNT >= 8 )); then
     RUN_GPUS=8
 else
-    RUN_GPUS=1
+    RUN_GPUS=$GPU_COUNT
 fi
 
 export PYTHONPATH="${PYTHONPATH:-$PROJECT_ROOT}"
