@@ -195,8 +195,8 @@ for batch in tqdm(dataloader, disable=(local_rank != 0)):
                 return_latents=True
             )
     
-            torch.save(latent.cpu(), os.path.join(args.output_folder, f"full_21_latent_{idx}.pt"))
-            current_video = video[:, :args.num_decode_frames, ...]
+            # torch.save(latent.cpu(), os.path.join(args.output_folder, f"full_21_latent_{idx}.pt"))
+            current_video = video
             current_video = rearrange(current_video, "b t c h w -> b t h w c").cpu()
             current_video = (255.0 * current_video).clamp(0, 255).to(torch.uint8)
             write_video(output_path, current_video[0], fps=args.fps)

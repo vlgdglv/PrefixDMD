@@ -14,7 +14,7 @@ set -euo pipefail
 # RUN_NAME=prefix_dmd_chunkwise_2window_20261105_194027/checkpoint_model_000800
 # RUN_NAME=prefix_dmd_chunkwise_2window_dfd//checkpoint_model_000400
 # RUN_NAME=asymmetic_dmd_chunkwise/20261110_092847/checkpoint_model_001000
-RUN_NAME=asymmetic_dmd_chunkwise/20261111_001838/checkpoint_model_000800
+RUN_NAME=asymmetic_dmd_chunkwise/20261111_001838/checkpoint_model_010400
 # RUN_NAME=prefix_dmd_chunkwise_tfloss/20261107_011145/checkpoi nt_model_002000
 
 

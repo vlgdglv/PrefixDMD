@@ -233,6 +233,7 @@ class Trainer:
         self.save_critic = True
 
         # [GRAD-ACCUM] micro-batches per optimizer step (1 = original behaviour)
+        
         self.grad_accum_steps = max(1, int(getattr(config, "grad_accum_steps", 1)))
         if self.is_main_process:
             print(f"[Trainer] grad_accum_steps={self.grad_accum_steps}, effective batch = "
@@ -240,6 +241,9 @@ class Trainer:
                   f"{config.batch_size * self.world_size * self.grad_accum_steps}; "
                   f"per_rank_seed={getattr(config, 'per_rank_seed', True)}; "
                   f"fake_critic_warmup={self.warmup_fake_score}; start step={self.step}")
+            if getattr(config, "use_tf_loss", False):
+                engage_tf_step = getattr(config, "engage_tf_step", 0)
+                print(f"TF Loss will be engaged at: {engage_tf_step}")
         ##############################################################################################################
         
         ##############################################################################################################
@@ -347,33 +351,6 @@ class Trainer:
         self.generator_optimizer.zero_grad(set_to_none=True)
         generator_loss = 0.0
         for ode_latent, conditional_dict in micro_batches:                  # [GRAD-ACCUM]
-
-            # print("#### Checking 1: Gradient flowing in context ")
-            # # Check 1:
-            # for flag in [True, False]:
-            #     torch.manual_seed(0); 
-            #     self.model.window_history_grad = flag
-            #     self.model.generator.zero_grad(set_to_none=True)
-            #     loss, _ = self.model.generator_loss(ode_latent, conditional_dict, self.unconditional_dict, global_step=10**6, chunk_idx=2)
-            #     loss.backward()
-            #     g = torch.cat([p.grad.flatten().float() for p in self.model.generator.parameters() if p.grad is not None])
-            #     if self.is_main_process:
-            #         print("ck1: ", flag, loss.item(), g.norm().item())
-
-            # print("#### Checking 1 done.")
-
-            # print("#### Checking 2: gradient checkpointing ")
-            # # Check 2:
-            # for ckpt in [True, False]:
-            #     torch.manual_seed(0); 
-            #     self.model.generator.model.gradient_checkpointing = ckpt
-            #     torch.manual_seed(0); self.model.generator.zero_grad(set_to_none=True)
-            #     loss, _ = self.model.generator_loss(ode_latent, conditional_dict, self.unconditional_dict, global_step=10**6, chunk_idx=0)
-            #     loss.backward()
-            #     g = torch.cat([p.grad.flatten().float() for p in self.model.generator.parameters() if p.grad is not None])
-            #     if self.is_main_process:
-            #         print("ck2: ", ckpt, loss.item(), g.norm().item())
-            # print("#### Checking 2 done.")
                 
             for idx, w in self._chunk_plan(ode_latent, "anchor_weight_gen"):
                 loss, log_dict = self.model.generator_loss(
@@ -395,7 +372,7 @@ class Trainer:
                     "chunk_idx": log_dict["chunk_idx"],
                 }
                 wandb.log(wandb_loss_dict, step=self.step)
-                if getattr(self.config, "use_tf_loss", False):
+                if getattr(self.config, "use_tf_loss", False) and self.step > getattr(self.config, "engage_tf_step", 0):
                     tf_loss = log_dict["tf_loss"]
                     dmd_loss = log_dict["dmd_loss"]
                     print("Step: ", self.step, ", generator_loss: ", generator_loss.item(), "generator_grad_norm: ", generator_grad_norm.item(),
@@ -403,7 +380,7 @@ class Trainer:
                 else:
                     print("Step: ", self.step, ", generator_loss: ", generator_loss.item(), "generator_grad_norm: ", generator_grad_norm.item(), "chunk_idx: ", log_dict["chunk_idx"])
             elif self.step % self.config.console_print_interval == 0:
-                if getattr(self.config, "use_tf_loss", False):
+                if getattr(self.config, "use_tf_loss", False) and self.step > getattr(self.config, "engage_tf_step", 0):
                     tf_loss = log_dict["tf_loss"]
                     dmd_loss = log_dict["dmd_loss"]
                     print("Step: ", self.step, ", generator_loss: ", generator_loss.item(), "generator_grad_norm: ", generator_grad_norm.item(),

@@ -389,7 +389,7 @@ class TeacherForcingDMD(nn.Module):
                 #     conditional_dict=unconditional_dict, 
                 #     timestep=score_timestep
                 # )
-                pred_real_uncond = self._critic_forward(self.real_score, prefix_real_tau, unconditional_dict, score_timestep, fut)  # 仅在 CFG 开启时
+                pred_real_uncond = self._critic_forward(self.real_score, prefix_real_tau, unconditional_dict, score_timestep, fut)
             
                 pred_real_prefix = pred_real_uncond + self.real_guidance_scale * (pred_real_cond - pred_real_uncond)
             else:
@@ -435,7 +435,7 @@ class TeacherForcingDMD(nn.Module):
             "chunk_idx": chunk_idx,
         }
 
-        if getattr(self.args, "use_tf_loss", False):
+        if getattr(self.args, "use_tf_loss", False) and global_step > getattr(self.args, "engage_tf_step", 0):
             tf_lambda = float(getattr(self.args, "tf_loss_lambda", 0.1))
             tf_loss = self.tf_flow_loss(clean_latent, conditional_dict)
             
