@@ -380,22 +380,36 @@ class TeacherForcingDMD(nn.Module):
             fut = torch.randn((batch_size, n_f, *prefix_tau.shape[2:]), device=self.device, dtype=prefix_tau.dtype) \
                 if (getattr(self.args, "native_length_critic", False) and n_f > 0) else None
                 
-            
-            pred_real_cond = self._critic_forward(self.real_score, prefix_real_tau, conditional_dict,   score_timestep, fut)
-            
-            if self.real_guidance_scale != 1.0:
-                # _, pred_real_uncond = self.real_score(
-                #     noisy_image_or_video=prefix_real_tau,
-                #     conditional_dict=unconditional_dict, 
-                #     timestep=score_timestep
-                # )
-                pred_real_uncond = self._critic_forward(self.real_score, prefix_real_tau, unconditional_dict, score_timestep, fut)
-            
-                pred_real_prefix = pred_real_uncond + self.real_guidance_scale * (pred_real_cond - pred_real_uncond)
+            if self.trainable_realscore:
+                pred_real_cond = self._critic_forward(self.real_score, prefix_real_tau, conditional_dict,   score_timestep, fut)
+                if self.real_guidance_scale != 1.0:
+                    # _, pred_real_uncond = self.real_score(
+                    #     noisy_image_or_video=prefix_real_tau,
+                    #     conditional_dict=unconditional_dict, 
+                    #     timestep=score_timestep
+                    # )
+                    pred_real_uncond = self._critic_forward(self.real_score, prefix_real_tau, unconditional_dict, score_timestep, fut)
+                    pred_real_prefix = pred_real_uncond + self.real_guidance_scale * (pred_real_cond - pred_real_uncond)
+                else:
+                    pred_real_prefix = pred_real_cond
+                pred_real = pred_real_prefix[:, -self.leaf_frames:]       
             else:
-                pred_real_prefix = pred_real_cond
-            pred_real = pred_real_prefix[:, -self.leaf_frames:]                # [WINDOW]
-
+                real_full = torch.cat([score_context, x_fake.detach(), clean_latent[:, ctx_end + self.leaf_frames:],], dim=1)
+                real_t = tau.repeat(1, real_full.shape[1])
+                real_noise = torch.randn_like(real_full)
+                real_noise[:, ctx_end:ctx_end + self.leaf_frames] = noise[:, -self.leaf_frames:]
+                
+                real_full_tau = self.scheduler.add_noise(real_full.flatten(0, 1), real_noise.flatten(0, 1), real_t.flatten(0, 1)).unflatten(0, real_full.shape[:2])
+                
+                F_p = prefix_clean.shape[1]
+                pred_real_cond = self._real_critic_forward(self.real_score, real_full_tau[:, :F_p], conditional_dict, real_t[:, :F_p], real_full_tau[:, F_p:],)
+                if self.real_guidance_scale != 1.0:
+                    pred_real_uncond = self._real_critic_forward(self.real_score, real_full_tau[:, :F_p], unconditional_dict, real_t[:, :F_p], real_full_tau[:, F_p:],)
+                    pred_real_prefix = pred_real_uncond + self.real_guidance_scale * (pred_real_cond - pred_real_uncond)
+                else:
+                    pred_real_prefix = pred_real_cond
+                pred_real = pred_real_prefix[:, -self.leaf_frames:] 
+                
             # --------------------------------------------------
             # 5. causal SELF fake-score
             # --------------------------------------------------
@@ -456,6 +470,26 @@ class TeacherForcingDMD(nn.Module):
             x_tau = torch.cat([x_tau, fut], dim=1)
             t = torch.cat([t, torch.full((t.shape[0], n_f), 1000.0, device=t.device, dtype=t.dtype)], dim=1)
         _, x0 = critic(noisy_image_or_video=x_tau, conditional_dict=cond, timestep=t)
+        return x0[:, :F_p]
+    
+    def _real_critic_forward(self, critic, x_tau, cond, t, fut=None):
+        F_p = x_tau.shape[1]
+        n_f = self.num_training_frames - F_p
+        tau = t[:, -1:]
+
+        assert n_f >= 0
+        assert (t == tau).all(), "Real critic requires uniform timesteps"
+
+        if n_f > 0:
+            x_tau = torch.cat([x_tau, fut], dim=1)
+
+        t = tau.expand(-1, x_tau.shape[1]).contiguous()
+
+        _, x0 = critic(
+            noisy_image_or_video=x_tau,
+            conditional_dict=cond,
+            timestep=t,
+        )
         return x0[:, :F_p]
 
     def four_step_generate_with_grad(
